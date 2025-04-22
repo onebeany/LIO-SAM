@@ -30,6 +30,28 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(OusterPointXYZIRT,
     (uint8_t, ring, ring) (uint16_t, noise, noise) (uint32_t, range, range)
 )
 
+
+
+namespace mlx_ros {
+    struct EIGEN_ALIGN16 Point {
+        PCL_ADD_POINT4D;
+        float intensity;
+        uint32_t offset_time;
+        uint16_t ring;
+        EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    };
+}
+
+POINT_CLOUD_REGISTER_POINT_STRUCT(mlx_ros::Point,
+    (float, x, x)
+    (float, y, y)
+    (float, z, z)
+    (float, intensity, intensity)
+    (uint32_t, offset_time, offset_time)
+    (uint16_t, ring, ring)
+)
+
+
 // Use the Velodyne point format as a common representation
 using PointXYZIRT = VelodynePointXYZIRT;
 
@@ -68,6 +90,7 @@ private:
 
     pcl::PointCloud<PointXYZIRT>::Ptr laserCloudIn;
     pcl::PointCloud<OusterPointXYZIRT>::Ptr tmpOusterCloudIn;
+    pcl::PointCloud<mlx_ros::Point>::Ptr tmpMLXCloudIn;
     pcl::PointCloud<PointType>::Ptr   fullCloud;
     pcl::PointCloud<PointType>::Ptr   extractedCloud;
 
@@ -108,6 +131,7 @@ public:
     {
         laserCloudIn.reset(new pcl::PointCloud<PointXYZIRT>());
         tmpOusterCloudIn.reset(new pcl::PointCloud<OusterPointXYZIRT>());
+        tmpMLXCloudIn.reset(new pcl::PointCloud<mlx_ros::Point>());
         fullCloud.reset(new pcl::PointCloud<PointType>());
         extractedCloud.reset(new pcl::PointCloud<PointType>());
 
@@ -225,6 +249,35 @@ public:
                 dst.ring = src.ring;
                 dst.time = src.t * 1e-9f;
             }
+        } else if (sensor == SensorType::ML_X) {
+            // ML-X 포인트 클라우드 변환
+            pcl::PointCloud<mlx_ros::Point>::Ptr tmpMLXCloudIn(new pcl::PointCloud<mlx_ros::Point>());
+            pcl::moveFromROSMsg(currentCloudMsg, *tmpMLXCloudIn);
+            
+            // NaN 포인트 필터링
+            pcl::PointCloud<mlx_ros::Point>::Ptr tmpMLXCloudFiltered(new pcl::PointCloud<mlx_ros::Point>());
+            std::vector<int> indices;
+            pcl::removeNaNFromPointCloud(*tmpMLXCloudIn, *tmpMLXCloudFiltered, indices);
+            
+            if (tmpMLXCloudFiltered->size() < tmpMLXCloudIn->size()) {
+                ROS_WARN("Filtered %ld NaN points from ML-X point cloud", 
+                        tmpMLXCloudIn->size() - tmpMLXCloudFiltered->size());
+            }
+            
+            laserCloudIn->points.resize(tmpMLXCloudFiltered->size());
+            laserCloudIn->is_dense = true;  // NaN 제거 후 dense로 설정
+            
+            for (size_t i = 0; i < tmpMLXCloudFiltered->size(); i++) {
+                auto &src = tmpMLXCloudFiltered->points[i];
+                auto &dst = laserCloudIn->points[i];
+                
+                dst.x = src.x;
+                dst.y = src.y;
+                dst.z = src.z;
+                dst.intensity = src.intensity;
+                dst.ring = src.ring;
+                dst.time = src.offset_time * 1e-9f;
+            }
         }
         else
         {
@@ -270,7 +323,7 @@ public:
             deskewFlag = -1;
             for (auto &field : currentCloudMsg.fields)
             {
-                if (field.name == "time" || field.name == "t")
+                if (field.name == "time" || field.name == "t" || field.name == "offset_time")
                 {
                     deskewFlag = 1;
                     break;
@@ -555,7 +608,19 @@ public:
                 columnIdn = columnIdnCountVec[rowIdn];
                 columnIdnCountVec[rowIdn] += 1;
             }
-            
+            else if (sensor == SensorType::ML_X) {
+                float horizonAngle = atan2(thisPoint.y, thisPoint.x) * 180 / M_PI;
+                static float mlx_fov = 120.0; // 수평 FOV
+                static float ang_res_x = mlx_fov/float(Horizon_SCAN); // 각도 해상도
+                
+                // 시야각이 -60도~+60도일 때 0~191 컬럼으로 매핑
+                columnIdn = round((horizonAngle + mlx_fov/2)/ang_res_x);
+                
+                // FOV 밖의 포인트는 무시
+                if (horizonAngle < -mlx_fov/2 || horizonAngle > mlx_fov/2)
+                    continue;
+            }
+                
             if (columnIdn < 0 || columnIdn >= Horizon_SCAN)
                 continue;
 
